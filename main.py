@@ -2,39 +2,28 @@ import logging
 import os
 import sys
 
-import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# from sklearn.impute import SimpleImputer
-#
-# from sklearn.preprocessing import LabelEncoder, MinMaxScaler
-# from sklearn.model_selection import train_test_split
-#
-# from sklearn.linear_model import LinearRegression, SGDRegressor, Lasso, Ridge, ElasticNet
-# from sklearn.svm import SVR
-# from sklearn.neighbors import KNeighborsRegressor
-# from sklearn.tree import DecisionTreeRegressor
-# from sklearn.ensemble import RandomForestRegressor, BaggingRegressor, ExtraTreesRegressor, AdaBoostRegressor
-# from xgboost import XGBRegressor
-# from catboost import CatBoostRegressor
-# from lightgbm import LGBMRegressor
-#
-# from sklearn.metrics import mean_squared_error
-
-
-# Гипотеза о корреляции между реакциями и настроением:
-# Можно предположить, что положительные реакции (“rocket”, “buy-up”)
-# связаны с положительными комментариями, а отрицательные
-# (“dislike”, “not-convinced”) — с негативными.
-# Проведите анализ тональности текста и посмотрите, коррелирует ли он с типом реакций.
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
 
 logger = logging.getLogger(__name__)
 
 # Установим уровень логирования на WARNING, чтобы исключить отладочные сообщения
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 
+
+def turn_memory_into_GB(value):
+    if "GB" in value:
+        return float(value[: value.find("GB")]) * 1000
+    elif "TB" in value:
+        return float(value[: value.find("TB")]) * 10**6
+
+# Гипотеза: Цена ноутбука зависит от множества характеристик,
+# включая бренд, тип ноутбука, объем оперативной памяти, тип хранилища и разрешение экрана.
 
 def analys_start():
     """
@@ -45,147 +34,124 @@ def analys_start():
         os.path.dirname(os.path.abspath(__file__)), "data", "laptop_price_dataset.csv"
     )
     # Читаем CSV файл
-    df = pd.read_csv(file_path)
+    df: pd.DataFrame = pd.read_csv(file_path)
 
-    logger.info(f'Дублирующиеся значения: {df.duplicated().sum().item()}')
-    df_description_all = df.describe(include='all')
+    # -------------------------------- Провожу очистку и подготовку данных --------------------------------
+    # убираю столбец Product
+    df = df.drop("Product", axis=1)
 
-    # ------------------------------------ Анализ по разным атрибутам ноутбуков ------------------------------------
-    # Проанализируем кол-во ноутбуков по каждому бренду, т.е. сколько ноутбуков у каждого бренда
-    company = df['Company'].value_counts()
+    df = df.join(pd.get_dummies(df.Company))
+    df = df.drop("Company", axis=1)
 
-    sns.set_style('darkgrid', {"grid.color": "0.6", "grid.linestyle": ":"})
-    company = company.sort_values(ascending=True)
-    company.plot(kind='barh', edgecolor='#1F77B4', title='Количество ноутбуков по каждому бренду')
+    df = df.join(pd.get_dummies(df.TypeName))
+    df = df.drop("TypeName", axis=1)
 
-    # Отобразим график количества компаний-производителей ноутбуков
-    plt.xlabel("Количество ноутбуков")
-    plt.ylabel("Бренды")
-    plt.xticks(range(0, company.max() + 1, 10))
+    # Разбиваем столбец ScreenResolution (разрешение экрана) на ширину и высоту
+    df["ScreenResolution"] = df.ScreenResolution.str.split().apply(lambda x: x[-1])
+    df["Screen Width"] = df.ScreenResolution.str.split("x").apply(lambda x: x[0])
+    df["Screen Height"] = df.ScreenResolution.str.split("x").apply(lambda x: x[1])
+    # приводим Screen Width и Height к типу int
+    df["Screen Width"] = df["Screen Width"].astype("int")
+    df["Screen Height"] = df["Screen Height"].astype("int")
+    # убираю столбец ScreenResolution
+    df = df.drop("ScreenResolution", axis=1)
+
+    # переименуем столбцы
+    df["CPU Brand"] = df["CPU_Company"]
+    df["CPU Frequency"] = df["CPU_Frequency (GHz)"]
+
+    # удаляем старые столбцы CPU_Company и CPU_Frequency (GHz)
+    df = df.drop(columns=["CPU_Company", "CPU_Frequency (GHz)"])
+
+    # переименуем столбец
+    df["RAM"] = df["RAM (GB)"]
+    # удалим старый столбец
+    df = df.drop("RAM (GB)", axis=1)
+
+    df["Memory Amount"] = df.Memory.str.split(" ").apply(lambda x: x[0])
+    df["Memory Type"] = df.Memory.str.split(" ").apply(lambda x: x[1])
+    df["Memory Amount"] = df["Memory Amount"].apply(turn_memory_into_GB)
+    df = df.drop("Memory Type", axis=1)
+    df = df.drop("Memory", axis=1)
+
+    df["Weight"] = df["Weight (kg)"]
+    df = df.drop("Weight (kg)", axis=1)
+
+    df["GPU Brand"] = df["GPU_Company"]
+    df = df.drop("GPU_Company", axis=1)
+
+    df = df.join(pd.get_dummies(df.OpSys))
+    df = df.drop("OpSys", axis=1)
+
+    cpu_categories = pd.get_dummies(df["CPU Brand"])
+    cpu_categories.columns = [col + "_CPU" for col in cpu_categories.columns]
+
+    df = df.join(cpu_categories)
+    df = df.drop("CPU Brand", axis=1)
+
+    gpu_categories = pd.get_dummies(df["GPU Brand"])
+    gpu_categories.columns = [col + "_GPU" for col in gpu_categories.columns]
+
+    df = df.join(gpu_categories)
+    df = df.drop("GPU Brand", axis=1)
+
+    df = df.drop(columns=["CPU_Type", "GPU_Type"])
+
+    target_correlations = df.corr()["Price (Euro)"].apply(abs).sort_values()
+
+    # Определяем 20 наиболее значимых признаков (с самой высокой корреляцией с Price (Euro))
+    selected_features = target_correlations[-20 :].index
+    selected_features = list(selected_features)
+
+    limited_df = df[selected_features]
+
+    # Строю корреляционную матрицу ограниченной выборки из 20 параметров
+    plt.figure(figsize=(18, 15))
+    sns.heatmap(limited_df.corr(), annot=True, cmap="YlGnBu")
     plt.show()
 
-    company_count_df: pd.DataFrame = pd.DataFrame(company.sort_values(ascending=False))
+    # Разделяем признаки на факторные (X) и результативный (y)
+    X, y = limited_df.drop("Price (Euro)", axis=1), limited_df["Price (Euro)"]
 
-    # Проанализируем кол-во ноутбуков по типу ноутбука, т.е. сколько ноутбуков каждого типа
-    # Типы ноутбуков:
-    # Notebook - обычный ноутбук (стандартный),
-    # Gaming - игровой ноутбук (для компьютерных игр),
-    # Ultrabook - ультрабук (компактный, тонкий по толщине, производительный для такого формата),
-    # 2 in 1 Convertible - ноутбук 2 в 1 (ноутбук-трансформер),
-    # Workstation - ноутбук-рабочая станция (большая диагональ, хороший аккумулятор - отлично подходит для долгой работы),
-    # Netbook -
-    type_name = df['TypeName'].value_counts()
+    # Разделяю данные на обучающую и тестовые выборки
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15)
+    scaler = StandardScaler()
 
-    sns.set_style('darkgrid', {"grid.color": "0.6", "grid.linestyle": ":"})
-    type_name.plot(kind='bar', color='#BD3A3C', edgecolor='#BD3A3C', title='Количество ноутбуков по типам')
-    plt.xlabel("Типы ноутбуков")
-    plt.ylabel("Кол-во ноутбуков")
-    plt.xticks(rotation=30)
+    # fit_transform вычисляет параметры масштабирования
+    # (среднее, стандартное отклонение) на обучающей выборке
+    # и масштабирует её
+    X_trained_scaled = scaler.fit_transform(X_train)
+
+    # transform масштабирует тестовую выборку,
+    # используя параметры на обучающей
+    X_test_scaled = scaler.transform(X_test)
+
+    # Обучение модели RandomForestRegressor на масштабированных данных
+    forest = RandomForestRegressor()
+    forest.fit(X_trained_scaled, y_train)
+
+    print(f"Оценка качества модели на тестовой выборке: {forest.score(X_test_scaled, y_test)}")
+
+    # предсказание модели на тестовой выборке
+    y_pred = forest.predict(X_test_scaled)
+
+    # Визуализирую предсказанные и реальные значения
+    plt.figure(figsize=(12, 8))
+    plt.scatter(y_pred, y_test)
+    plt.plot(range(0, 6000), range(0, 6000), c="red")
     plt.show()
 
-    type_laptops_df: pd.DataFrame = pd.DataFrame(type_name)
+    # Тестирую модель на одном экземпляре из тестовой выборки
+    X_new_scaled = scaler.transform([X_test.iloc[0]])
+    print(f"Предсказанная цена для одного экземпляра: {forest.predict(X_new_scaled)}")
+    print(f"Значение целевой переменной для одного экземпляра: {y_test.iloc[0]}")
 
-    # Проанализируем разрешения экранов
-    resolution = df['ScreenResolution'].value_counts()
-
-    plt.figure(figsize=(8, 10))
-    sns.set_style('darkgrid', {"grid.color": "0.6", "grid.linestyle": ":"})
-    resolution = resolution.sort_values(ascending=True)
-    resolution.plot(kind='barh', color='#C4B324', edgecolor='#C4B324', title='Количество ноутбуков разных разрешений экранов')
-    plt.xlabel("Количество ноутбуков")
-    plt.ylabel("Разрешения экранов")
-    plt.show()
-
-    screen_resolutions_df: pd.DataFrame = pd.DataFrame(resolution.sort_values(ascending=False))
-
-    # Проанализируем по производителям процессоров
-    cpu_company = df['CPU_Company'].value_counts()
-
-    cpu_company.plot(kind='bar', color='gray', edgecolor='black', width=0.3, title='Количество ноутбуков по производителям процессора (CPU)')
-    plt.show()
-
-    cpu_company_df: pd.DataFrame = pd.DataFrame(cpu_company)
-
-    # Проанализируем по частоте процессора ноутбука
-    freq = df['CPU_Frequency (GHz)'].value_counts()
-
-    plt.figure(figsize=(7, 7))
-    sns.set_style('darkgrid', {"grid.color": "0.6", "grid.linestyle": ":"})
-    freq = freq.sort_values(ascending=True)
-    freq.plot(kind='barh', color='gray', edgecolor='black', title='Количество ноутбуков по частоте процессора')
-    plt.xlabel("Количество ноутбуков с частотой процессора")
-    plt.ylabel("Частота процессора")
-    plt.show()
-
-    freq_df: pd.DataFrame = pd.DataFrame(freq.sort_values(ascending=False))
-
-    # Проанализируем количество оперативной памяти
-    ram = df['RAM (GB)'].value_counts()
-
-    sns.set_style('darkgrid', {"grid.color": "0.6", "grid.linestyle": ":"})
-    ram.plot(kind='bar', color='gray', edgecolor='black', title="Количество по оперативной памяти")
-    plt.xlabel("Оперативная память")
-    plt.ylabel("Количество ноутбуков")
-    plt.xticks(rotation=0)
-    plt.show()
-
-    ram_df: pd.DataFrame = pd.DataFrame(ram)
-
-    # Количество памяти
-    memory = df['Memory'].value_counts()
-
-    plt.figure(figsize=(8, 10))
-    sns.set_style('darkgrid', {"grid.color": "0.6", "grid.linestyle": ":"})
-    memory = memory.sort_values(ascending=True)
-    memory.plot(kind='barh', color='#2B9479', edgecolor='#2B9479', title="Количество по памяти")
-    plt.xlabel("Количество ноутбуков")
-    plt.ylabel("Память")
-    plt.show()
-
-    memory_df: pd.DataFrame = pd.DataFrame(memory.sort_values(ascending=False))
-
-    # Проанализируем производителей графических процессоров
-    gpu_company = df['GPU_Company'].value_counts()
-
-    gpu_company.plot(kind='bar', color='#BA9329', edgecolor='#BA9329', width=0.3, title='Количество по графическим процессорам')
-    plt.xlabel("Бренды")
-    plt.ylabel("Количество графич. процессоров")
-    plt.xticks(rotation=0)
-    plt.show()
-
-    gpu_company_df: pd.DataFrame = pd.DataFrame(gpu_company)
-
-    # Проанализируем по операционным системам
-    op_sys = df['OpSys'].value_counts()
-
-    plt.figure(figsize=(10, 4))
-    op_sys.plot(kind='bar', color='#BA9329', edgecolor='#BA9329', title='Количество по операционным системам')
-    plt.xticks(rotation=0)
-    plt.show()
-
-    op_sys_df: pd.DataFrame = pd.DataFrame(op_sys)
-
-    # Проанализируем веса ноутбуков
-    weight = df['Weight (kg)']
-
-    # plt.figure(figsize=(10,4))
-    sns.histplot(weight, kde=True)
-    plt.xticks(rotation=0)
-    plt.show()
-
-    weight_df: pd.DataFrame = pd.DataFrame(weight.describe())
-
-    # Проанализируем по цене
-    price_euro = df['Price (Euro)']
-
-    # plt.figure(figsize=(10,4))
-    sns.histplot(price_euro, kde=True)
-    plt.xlabel("Тысячи евро")
-    plt.ylabel("Количество ноутбуков")
-    plt.xticks(rotation=0)
-    plt.show()
-
-    pd.DataFrame(price_euro.describe())
+    # Итог
+    # После построения корреляционной матрицы я:
+    # 	1.	Анализирую корреляции, чтобы выбрать значимые признаки.
+    # 	2.	Сужаю набор данных до наиболее значимых признаков.
+    # 	3.	Обучаю модель на подготовленных данных.
+    # 	4.	Оцениваю её качество и интерпретирую предсказания.
 
 
 if __name__ == "__main__":
